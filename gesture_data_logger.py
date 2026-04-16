@@ -16,6 +16,8 @@ MODEL_URL = (
 )
 MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
 DATASET_PATH = Path(__file__).with_name("gesture67_landmarks.csv")
+LANDMARK_VALUES_PER_HAND = 21 * 3
+EXPECTED_COLUMN_COUNT = 1 + (LANDMARK_VALUES_PER_HAND * 2)
 
 
 def ensure_model_file() -> Path:
@@ -29,11 +31,24 @@ def ensure_model_file() -> Path:
 
 def ensure_csv_header(csv_path: Path) -> None:
     if csv_path.exists() and csv_path.stat().st_size > 0:
-        return
+        with csv_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            first_row = next(reader, None)
+        if first_row and len(first_row) == EXPECTED_COLUMN_COUNT:
+            return
+
+        fallback_path = csv_path.with_name(f"{csv_path.stem}_2hands{csv_path.suffix}")
+        print(
+            f"Existing CSV schema mismatch in {csv_path.name}. "
+            f"Switching to {fallback_path.name} for two-hand logging."
+        )
+        ensure_csv_header(fallback_path)
+        raise RuntimeError(f"CSV_SCHEMA_MISMATCH::{fallback_path}")
 
     header = ["label"]
-    for i in range(21):
-        header.extend([f"x{i}", f"y{i}", f"z{i}"])
+    for side in ("left", "right"):
+        for i in range(21):
+            header.extend([f"{side}_x{i}", f"{side}_y{i}", f"{side}_z{i}"])
 
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -45,6 +60,35 @@ def flatten_landmarks(landmarks) -> list[float]:
     for landmark in landmarks:
         row.extend([landmark.x, landmark.y, landmark.z])
     return row
+
+
+def build_two_hand_row(hand_landmarks, handedness, current_label: int) -> list[float]:
+    empty = [0.0] * LANDMARK_VALUES_PER_HAND
+    left_values = empty.copy()
+    right_values = empty.copy()
+    left_filled = False
+    right_filled = False
+
+    for idx, landmarks in enumerate(hand_landmarks):
+        values = flatten_landmarks(landmarks)
+        side = None
+        if idx < len(handedness) and handedness[idx]:
+            side = handedness[idx][0].category_name.lower()
+
+        if side == "left" and not left_filled:
+            left_values = values
+            left_filled = True
+        elif side == "right" and not right_filled:
+            right_values = values
+            right_filled = True
+        elif not left_filled:
+            left_values = values
+            left_filled = True
+        elif not right_filled:
+            right_values = values
+            right_filled = True
+
+    return [current_label] + left_values + right_values
 
 
 def draw_landmarks(frame, landmarks_list, handedness_list) -> None:
@@ -84,7 +128,15 @@ def draw_landmarks(frame, landmarks_list, handedness_list) -> None:
 
 def main() -> None:
     model_path = ensure_model_file()
-    ensure_csv_header(DATASET_PATH)
+    dataset_path = DATASET_PATH
+    try:
+        ensure_csv_header(dataset_path)
+    except RuntimeError as exc:
+        marker = "CSV_SCHEMA_MISMATCH::"
+        if str(exc).startswith(marker):
+            dataset_path = Path(str(exc)[len(marker) :])
+        else:
+            raise
 
     latest_result = {
         "timestamp_ms": -1,
@@ -112,7 +164,7 @@ def main() -> None:
     options = vision.HandLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.LIVE_STREAM,
-        num_hands=1,
+        num_hands=2,
         min_hand_detection_confidence=0.6,
         min_hand_presence_confidence=0.6,
         min_tracking_confidence=0.6,
@@ -123,7 +175,7 @@ def main() -> None:
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam. Check camera permissions and whether another app is using it.")
 
-    with DATASET_PATH.open("a", newline="", encoding="utf-8") as handle:
+    with dataset_path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
 
         with vision.HandLandmarker.create_from_options(options) as detector:
@@ -148,8 +200,8 @@ def main() -> None:
                 if hand_landmarks:
                     draw_landmarks(frame, hand_landmarks, handedness)
 
-                if is_recording and hand_landmarks:
-                    row = [current_label] + flatten_landmarks(hand_landmarks[0])
+                if is_recording and len(hand_landmarks) == 2:
+                    row = build_two_hand_row(hand_landmarks, handedness, current_label)
                     writer.writerow(row)
                     total_saved += 1
                     if current_label == 1:
@@ -187,11 +239,21 @@ def main() -> None:
                     2,
                     cv2.LINE_AA,
                 )
-                if is_recording and not hand_landmarks:
+                cv2.putText(
+                    frame,
+                    f"Hands detected: {len(hand_landmarks)} (logging left+right slots)",
+                    (10, 114),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (180, 255, 180),
+                    2,
+                    cv2.LINE_AA,
+                )
+                if is_recording and len(hand_landmarks) != 2:
                     cv2.putText(
                         frame,
-                        "No hand detected - no row written",
-                        (10, 114),
+                        "Need exactly 2 hands - no row written",
+                        (10, 142),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.65,
                         (0, 100, 255),
@@ -214,7 +276,7 @@ def main() -> None:
     cap.release()
     cv2.destroyAllWindows()
 
-    print(f"Dataset saved to: {DATASET_PATH}")
+    print(f"Dataset saved to: {dataset_path}")
     print(f"Total rows appended this run: {total_saved}")
     print(f"Positive label rows (1): {saved_positive}")
     print(f"Negative label rows (0): {saved_negative}")
