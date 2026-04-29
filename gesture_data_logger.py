@@ -16,6 +16,7 @@ MODEL_URL = (
 MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
 DEFAULT_OUTPUT_DIR = Path(__file__).with_name("hand_bbox_dataset")
 DEFAULT_ANNOTATION_FILE = "annotations.csv"
+COUNTER_FILE = "image_counter.txt"
 
 
 def ensure_model_file() -> Path:
@@ -181,6 +182,23 @@ def write_yolov8_txt(txt_path: Path, boxes: list[dict], class_index: int, img_wi
         fh.write("\n".join(lines))
 
 
+def read_image_counter(output_dir: Path) -> int:
+    """Read the persistent image counter from file. Returns 1 if file doesn't exist."""
+    counter_path = output_dir / COUNTER_FILE
+    if counter_path.exists():
+        try:
+            return int(counter_path.read_text(encoding="utf-8").strip())
+        except (ValueError, IOError):
+            return 1
+    return 1
+
+
+def write_image_counter(output_dir: Path, counter: int) -> None:
+    """Write the current image counter to persistent file."""
+    counter_path = output_dir / COUNTER_FILE
+    counter_path.write_text(str(counter), encoding="utf-8")
+
+
 def draw_preview(
     frame,
     boxes: list[dict],
@@ -273,8 +291,11 @@ def main() -> None:
     model_path = ensure_model_file()
 
     output_dir = Path(args.output_dir)
-    frames_dir = output_dir / "frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = output_dir / "dataset"
+    images_dir = dataset_dir / "images"
+    labels_dir = dataset_dir / "labels"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
     annotation_path = output_dir / DEFAULT_ANNOTATION_FILE
     ensure_annotation_csv(annotation_path)
 
@@ -302,6 +323,7 @@ def main() -> None:
     saved_frames = 0
     saved_boxes = 0
     black_frame_streak = 0
+    image_counter = read_image_counter(output_dir)
 
     with annotation_path.open("a", newline="", encoding="utf-8") as csv_handle:
         writer = csv.writer(csv_handle)
@@ -378,8 +400,8 @@ def main() -> None:
                         print(f"Skipped save for frame {frame_index}: no hands detected.")
                         continue
 
-                    image_name = f"frame_{frame_index:06d}.jpg"
-                    image_path = frames_dir / image_name
+                    image_name = f"image{image_counter}.jpg"
+                    image_path = images_dir / image_name
                     cv2.imwrite(str(image_path), frame)
 
                     selected_category = categories[current_category_index]
@@ -405,7 +427,7 @@ def main() -> None:
 
                     # Create YOLOv8 annotation file alongside the saved image
                     txt_name = image_name.rsplit(".", 1)[0] + ".txt"
-                    txt_path = frames_dir / txt_name
+                    txt_path = labels_dir / txt_name
                     write_yolov8_txt(
                         txt_path=txt_path,
                         boxes=boxes,
@@ -414,10 +436,12 @@ def main() -> None:
                         img_height=frame.shape[0],
                     )
 
+                    image_counter += 1
+                    write_image_counter(output_dir, image_counter)
                     saved_frames += 1
                     print(
                         f"Saved frame {frame_index} with category '{selected_category}' "
-                        f"and {len(boxes)} hand box(es). YOLO labels: {txt_path}"
+                        f"and {len(boxes)} hand box(es). Image: {image_path}"
                     )
 
     cap.release()
