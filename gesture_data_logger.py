@@ -1,7 +1,6 @@
 from pathlib import Path
+import argparse
 import csv
-import threading
-import time
 from urllib.request import urlretrieve
 
 import cv2
@@ -15,9 +14,8 @@ MODEL_URL = (
     "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 )
 MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
-DATASET_PATH = Path(__file__).with_name("gesture67_landmarks.csv")
-LANDMARK_VALUES_PER_HAND = 21 * 3
-EXPECTED_COLUMN_COUNT = 1 + (LANDMARK_VALUES_PER_HAND * 2)
+DEFAULT_OUTPUT_DIR = Path(__file__).with_name("hand_bbox_dataset")
+DEFAULT_ANNOTATION_FILE = "annotations.csv"
 
 
 def ensure_model_file() -> Path:
@@ -29,257 +27,405 @@ def ensure_model_file() -> Path:
     return MODEL_PATH
 
 
-def ensure_csv_header(csv_path: Path) -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Capture webcam frames and auto-annotate hand bounding boxes with MediaPipe. "
+            "Switch category labels per frame using keyboard shortcuts."
+        )
+    )
+    parser.add_argument(
+        "--categories",
+        default="gesture67,not67",
+        help="Comma-separated categories (max 9). Example: open,fist,point,none",
+    )
+    parser.add_argument(
+        "--frame-step",
+        type=int,
+        default=1,
+        help="Process every Nth webcam frame (default: 1).",
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="Webcam index passed to OpenCV VideoCapture (default: 0).",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=1280,
+        help="Requested webcam frame width (default: 1280).",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=720,
+        help="Requested webcam frame height (default: 720).",
+    )
+    parser.add_argument(
+        "--no-mirror",
+        action="store_true",
+        help="Disable horizontal mirroring of webcam frames.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Folder where extracted frames and CSV annotations are stored.",
+    )
+    parser.add_argument(
+        "--bbox-padding",
+        type=int,
+        default=40,
+        help="Padding (pixels) added around each detected hand bounding box.",
+    )
+    return parser.parse_args()
+
+
+def parse_categories(categories_raw: str) -> list[str]:
+    categories = [item.strip() for item in categories_raw.split(",") if item.strip()]
+    if not categories:
+        raise ValueError("At least one category is required.")
+    if len(categories) > 9:
+        raise ValueError("Maximum 9 categories are supported (keys 1-9).")
+    return categories
+
+
+def ensure_annotation_csv(csv_path: Path) -> None:
+    expected_header = [
+        "image_path",
+        "frame_index",
+        "timestamp_ms",
+        "category",
+        "hand_index",
+        "handedness",
+        "handedness_score",
+        "x_min",
+        "y_min",
+        "x_max",
+        "y_max",
+    ]
+
     if csv_path.exists() and csv_path.stat().st_size > 0:
         with csv_path.open("r", newline="", encoding="utf-8") as handle:
-            reader = csv.reader(handle)
-            first_row = next(reader, None)
-        if first_row and len(first_row) == EXPECTED_COLUMN_COUNT:
+            first_row = next(csv.reader(handle), None)
+        if first_row == expected_header:
             return
-
-        fallback_path = csv_path.with_name(f"{csv_path.stem}_2hands{csv_path.suffix}")
-        print(
-            f"Existing CSV schema mismatch in {csv_path.name}. "
-            f"Switching to {fallback_path.name} for two-hand logging."
+        raise RuntimeError(
+            "Annotation CSV exists with incompatible schema. "
+            f"Please rename/remove: {csv_path}"
         )
-        ensure_csv_header(fallback_path)
-        raise RuntimeError(f"CSV_SCHEMA_MISMATCH::{fallback_path}")
-
-    header = ["label"]
-    for side in ("left", "right"):
-        for i in range(21):
-            header.extend([f"{side}_x{i}", f"{side}_y{i}", f"{side}_z{i}"])
 
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(header)
+        csv.writer(handle).writerow(expected_header)
 
 
-def flatten_landmarks(landmarks) -> list[float]:
-    row = []
-    for landmark in landmarks:
-        row.extend([landmark.x, landmark.y, landmark.z])
-    return row
+def to_hand_bbox(hand_landmarks, width: int, height: int, padding: int) -> tuple[int, int, int, int]:
+    xs = [landmark.x for landmark in hand_landmarks]
+    ys = [landmark.y for landmark in hand_landmarks]
+
+    x_min = max(0, int(min(xs) * width) - padding)
+    y_min = max(0, int(min(ys) * height) - padding)
+    x_max = min(width - 1, int(max(xs) * width) + padding)
+    y_max = min(height - 1, int(max(ys) * height) + padding)
+    return x_min, y_min, x_max, y_max
 
 
-def build_two_hand_row(hand_landmarks, handedness, current_label: int) -> list[float]:
-    empty = [0.0] * LANDMARK_VALUES_PER_HAND
-    left_values = empty.copy()
-    right_values = empty.copy()
-    left_filled = False
-    right_filled = False
+def extract_hand_boxes(result, frame_width: int, frame_height: int, padding: int) -> list[dict]:
+    boxes = []
+    for hand_idx, hand_landmarks in enumerate(result.hand_landmarks):
+        x_min, y_min, x_max, y_max = to_hand_bbox(hand_landmarks, frame_width, frame_height, padding)
 
-    for idx, landmarks in enumerate(hand_landmarks):
-        values = flatten_landmarks(landmarks)
-        side = None
-        if idx < len(handedness) and handedness[idx]:
-            side = handedness[idx][0].category_name.lower()
+        side = "unknown"
+        score = 0.0
+        if hand_idx < len(result.handedness) and result.handedness[hand_idx]:
+            cat = result.handedness[hand_idx][0]
+            side = cat.category_name.lower()
+            score = float(cat.score)
 
-        if side == "left" and not left_filled:
-            left_values = values
-            left_filled = True
-        elif side == "right" and not right_filled:
-            right_values = values
-            right_filled = True
-        elif not left_filled:
-            left_values = values
-            left_filled = True
-        elif not right_filled:
-            right_values = values
-            right_filled = True
-
-    return [current_label] + left_values + right_values
+        boxes.append(
+            {
+                "hand_index": hand_idx,
+                "handedness": side,
+                "handedness_score": score,
+                "x_min": x_min,
+                "y_min": y_min,
+                "x_max": x_max,
+                "y_max": y_max,
+            }
+        )
+    return boxes
 
 
-def draw_landmarks(frame, landmarks_list, handedness_list) -> None:
-    height, width = frame.shape[:2]
-    connections = vision.HandLandmarksConnections.HAND_CONNECTIONS
+def write_yolov8_txt(txt_path: Path, boxes: list[dict], class_index: int, img_width: int, img_height: int) -> None:
+    """
+    Write YOLOv8-format annotations to `txt_path`.
 
-    for idx, hand_landmarks in enumerate(landmarks_list):
-        points = []
-        for landmark in hand_landmarks:
-            px = int(landmark.x * width)
-            py = int(landmark.y * height)
-            points.append((px, py))
-            cv2.circle(frame, (px, py), 3, (0, 220, 0), -1)
+    Each line: <class> <x_center> <y_center> <width> <height> (normalized 0..1)
+    """
+    lines: list[str] = []
+    for box in boxes:
+        x_min = box["x_min"]
+        y_min = box["y_min"]
+        x_max = box["x_max"]
+        y_max = box["y_max"]
 
-        for connection in connections:
-            start = points[connection.start]
-            end = points[connection.end]
-            cv2.line(frame, start, end, (0, 140, 255), 2)
+        x_center = (x_min + x_max) / 2.0 / img_width
+        y_center = (y_min + y_max) / 2.0 / img_height
+        w = (x_max - x_min) / img_width
+        h = (y_max - y_min) / img_height
 
-        label = "Hand"
-        if idx < len(handedness_list) and handedness_list[idx]:
-            label = handedness_list[idx][0].category_name
+        lines.append(f"{class_index} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
 
-        label_x = max(10, points[0][0] - 40)
-        label_y = max(30, points[0][1] - 20)
+    with txt_path.open("w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+
+def draw_preview(
+    frame,
+    boxes: list[dict],
+    current_category: str,
+    categories: list[str],
+    frame_idx: int,
+    saved_frames: int,
+    saved_boxes: int,
+) -> None:
+    for box in boxes:
+        x_min = box["x_min"]
+        y_min = box["y_min"]
+        x_max = box["x_max"]
+        y_max = box["y_max"]
+        side = box["handedness"]
+
+        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 200, 255), 2)
         cv2.putText(
             frame,
-            label,
-            (label_x, label_y),
+            side,
+            (x_min, max(18, y_min - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 200, 0),
+            0.6,
+            (255, 255, 0),
             2,
             cv2.LINE_AA,
         )
 
+    category_hint = " | ".join([f"{idx + 1}:{name}" for idx, name in enumerate(categories)])
+    cv2.putText(
+        frame,
+        f"Frame: {frame_idx} | Category: {current_category}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        "Live feed | S save frame | Q quit",
+        (10, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (120, 255, 120),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Category keys: {category_hint}",
+        (10, 86),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (220, 220, 220),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Detected hands: {len(boxes)}",
+        (10, 114),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (0, 230, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Saved frames: {saved_frames} | Saved boxes: {saved_boxes}",
+        (10, 142),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (255, 220, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
 
 def main() -> None:
+    args = parse_args()
+    if args.frame_step < 1:
+        raise ValueError("--frame-step must be >= 1")
+
+    categories = parse_categories(args.categories)
+    current_category_index = 0
+
     model_path = ensure_model_file()
-    dataset_path = DATASET_PATH
-    try:
-        ensure_csv_header(dataset_path)
-    except RuntimeError as exc:
-        marker = "CSV_SCHEMA_MISMATCH::"
-        if str(exc).startswith(marker):
-            dataset_path = Path(str(exc)[len(marker) :])
-        else:
-            raise
 
-    latest_result = {
-        "timestamp_ms": -1,
-        "hand_landmarks": [],
-        "handedness": [],
-    }
-    result_lock = threading.Lock()
-
-    def on_result(result, _output_image, timestamp_ms: int) -> None:
-        with result_lock:
-            if timestamp_ms >= latest_result["timestamp_ms"]:
-                latest_result["timestamp_ms"] = timestamp_ms
-                latest_result["hand_landmarks"] = result.hand_landmarks
-                latest_result["handedness"] = result.handedness
-
-    last_sent_timestamp_ms = -1
-
-    is_recording = False
-    current_label = 1
-    total_saved = 0
-    saved_positive = 0
-    saved_negative = 0
+    output_dir = Path(args.output_dir)
+    frames_dir = output_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    annotation_path = output_dir / DEFAULT_ANNOTATION_FILE
+    ensure_annotation_csv(annotation_path)
 
     base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
     options = vision.HandLandmarkerOptions(
         base_options=base_options,
-        running_mode=vision.RunningMode.LIVE_STREAM,
+        running_mode=vision.RunningMode.IMAGE,
         num_hands=2,
-        min_hand_detection_confidence=0.6,
-        min_hand_presence_confidence=0.6,
-        min_tracking_confidence=0.6,
-        result_callback=on_result,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(args.camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        raise RuntimeError("Could not open webcam. Check camera permissions and whether another app is using it.")
+        cap = cv2.VideoCapture(args.camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open webcam index {args.camera_index}")
 
-    with dataset_path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    frame_index = -1
+    saved_frames = 0
+    saved_boxes = 0
+    black_frame_streak = 0
+
+    with annotation_path.open("a", newline="", encoding="utf-8") as csv_handle:
+        writer = csv.writer(csv_handle)
 
         with vision.HandLandmarker.create_from_options(options) as detector:
             while True:
                 ok, frame = cap.read()
                 if not ok:
-                    print("Warning: Could not read frame from webcam.")
                     break
 
-                frame = cv2.flip(frame, 1)
+                frame_index += 1
+                if frame_index % args.frame_step != 0:
+                    continue
+
+                if not args.no_mirror:
+                    frame = cv2.flip(frame, 1)
+
+                if frame.mean() < 2.0:
+                    black_frame_streak += 1
+                else:
+                    black_frame_streak = 0
+
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                now_ms = int(time.monotonic() * 1000)
-                timestamp_ms = max(now_ms, last_sent_timestamp_ms + 1)
-                last_sent_timestamp_ms = timestamp_ms
-                detector.detect_async(mp_image, timestamp_ms)
+                result = detector.detect(mp_image)
 
-                with result_lock:
-                    hand_landmarks = latest_result["hand_landmarks"]
-                    handedness = latest_result["handedness"]
+                boxes = extract_hand_boxes(
+                    result=result,
+                    frame_width=frame.shape[1],
+                    frame_height=frame.shape[0],
+                    padding=args.bbox_padding,
+                )
 
-                if hand_landmarks:
-                    draw_landmarks(frame, hand_landmarks, handedness)
-
-                if is_recording and len(hand_landmarks) == 2:
-                    row = build_two_hand_row(hand_landmarks, handedness, current_label)
-                    writer.writerow(row)
-                    total_saved += 1
-                    if current_label == 1:
-                        saved_positive += 1
-                    else:
-                        saved_negative += 1
-
-                cv2.putText(
-                    frame,
-                    "CSV Logger - Q quit | R record | 1 label=67 | 0 label=not67",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
+                preview = frame.copy()
+                draw_preview(
+                    preview,
+                    boxes=boxes,
+                    current_category=categories[current_category_index],
+                    categories=categories,
+                    frame_idx=frame_index,
+                    saved_frames=saved_frames,
+                    saved_boxes=saved_boxes,
                 )
-                cv2.putText(
-                    frame,
-                    f"Recording: {'ON' if is_recording else 'OFF'} | Label: {current_label}",
-                    (10, 58),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255) if is_recording else (200, 200, 200),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    frame,
-                    f"Saved total: {total_saved} | pos(1): {saved_positive} | neg(0): {saved_negative}",
-                    (10, 86),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 220, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    frame,
-                    f"Hands detected: {len(hand_landmarks)} (logging left+right slots)",
-                    (10, 114),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (180, 255, 180),
-                    2,
-                    cv2.LINE_AA,
-                )
-                if is_recording and len(hand_landmarks) != 2:
+                if black_frame_streak >= 5:
                     cv2.putText(
-                        frame,
-                        "Need exactly 2 hands - no row written",
-                        (10, 142),
+                        preview,
+                        "Webcam appears black. Try --camera-index 1 or close other camera apps.",
+                        (10, 170),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (0, 100, 255),
+                        0.55,
+                        (0, 120, 255),
                         2,
                         cv2.LINE_AA,
                     )
-
-                cv2.imshow("Gesture 67 Data Logger", frame)
+                cv2.imshow("Video Hand BBox Annotator", preview)
 
                 key = cv2.waitKey(1) & 0xFF
+
                 if key == ord("q"):
-                    break
-                if key == ord("r"):
-                    is_recording = not is_recording
-                if key == ord("1"):
-                    current_label = 1
-                if key == ord("0"):
-                    current_label = 0
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    print(f"Annotation CSV: {annotation_path}")
+                    print(f"Saved frames: {saved_frames}")
+                    print(f"Saved hand boxes: {saved_boxes}")
+                    return
+
+                if ord("1") <= key <= ord("9"):
+                    selected_index = key - ord("1")
+                    if selected_index < len(categories):
+                        current_category_index = selected_index
+
+                if key == ord("s"):
+                    if not boxes:
+                        print(f"Skipped save for frame {frame_index}: no hands detected.")
+                        continue
+
+                    image_name = f"frame_{frame_index:06d}.jpg"
+                    image_path = frames_dir / image_name
+                    cv2.imwrite(str(image_path), frame)
+
+                    selected_category = categories[current_category_index]
+                    relative_image_path = image_path.relative_to(output_dir)
+                    # Write CSV rows (legacy) and YOLOv8 .txt labels per image
+                    for box in boxes:
+                        writer.writerow(
+                            [
+                                str(relative_image_path).replace("\\", "/"),
+                                frame_index,
+                                frame_index,
+                                selected_category,
+                                box["hand_index"],
+                                box["handedness"],
+                                f"{box['handedness_score']:.6f}",
+                                box["x_min"],
+                                box["y_min"],
+                                box["x_max"],
+                                box["y_max"],
+                            ]
+                        )
+                        saved_boxes += 1
+
+                    # Create YOLOv8 annotation file alongside the saved image
+                    txt_name = image_name.rsplit(".", 1)[0] + ".txt"
+                    txt_path = frames_dir / txt_name
+                    write_yolov8_txt(
+                        txt_path=txt_path,
+                        boxes=boxes,
+                        class_index=current_category_index,
+                        img_width=frame.shape[1],
+                        img_height=frame.shape[0],
+                    )
+
+                    saved_frames += 1
+                    print(
+                        f"Saved frame {frame_index} with category '{selected_category}' "
+                        f"and {len(boxes)} hand box(es). YOLO labels: {txt_path}"
+                    )
 
     cap.release()
     cv2.destroyAllWindows()
 
-    print(f"Dataset saved to: {dataset_path}")
-    print(f"Total rows appended this run: {total_saved}")
-    print(f"Positive label rows (1): {saved_positive}")
-    print(f"Negative label rows (0): {saved_negative}")
+    print(f"Annotation CSV: {annotation_path}")
+    print(f"Saved frames: {saved_frames}")
+    print(f"Saved hand boxes: {saved_boxes}")
 
 
 if __name__ == "__main__":
