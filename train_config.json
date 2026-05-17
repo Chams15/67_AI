@@ -1,0 +1,21 @@
+{
+  "data": "yolo_dataset_final/data.yaml",
+  "model": "yolov8s.pt",
+  "project": "runs/gesture_yolov8s",
+  "name": "gesture_yolov8s",
+  "epochs": 100,
+  "imgsz": 640,
+  "batch": 4,
+  "workers": 2,
+  "device": "auto",
+  "patience": 25,
+  "save_period": 5,
+  "seed": 67,
+  "lr0": 0.01,
+  "resume": false,
+  "fresh": false,
+  "cache": false,
+  "amp": true,
+  "close_mosaic": 10,
+  "plots": true
+}
