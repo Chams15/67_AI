@@ -4,6 +4,8 @@ import csv
 from urllib.request import urlretrieve
 
 import cv2
+import time
+import json
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
@@ -17,6 +19,7 @@ MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
 DEFAULT_OUTPUT_DIR = Path(__file__).with_name("hand_bbox_dataset")
 DEFAULT_ANNOTATION_FILE = "annotations.csv"
 COUNTER_FILE = "image_counter.txt"
+COUNTS_FILE = "category_counts.json"
 
 
 def ensure_model_file() -> Path:
@@ -199,14 +202,37 @@ def write_image_counter(output_dir: Path, counter: int) -> None:
     counter_path.write_text(str(counter), encoding="utf-8")
 
 
+def read_category_counts(output_dir: Path, categories: list[str]) -> dict:
+    """Read per-category saved image counts from JSON file. Ensure all categories present."""
+    counts_path = output_dir / COUNTS_FILE
+    if counts_path.exists():
+        try:
+            data = json.loads(counts_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    else:
+        data = {}
+
+    # Ensure keys for all categories
+    for c in categories:
+        if c not in data:
+            data[c] = 0
+    return data
+
+
+def write_category_counts(output_dir: Path, counts: dict) -> None:
+    counts_path = output_dir / COUNTS_FILE
+    counts_path.write_text(json.dumps(counts, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def draw_preview(
     frame,
     boxes: list[dict],
     current_category: str,
     categories: list[str],
-    frame_idx: int,
     saved_frames: int,
     saved_boxes: int,
+    category_counts: dict,
 ) -> None:
     for box in boxes:
         x_min = box["x_min"]
@@ -230,7 +256,7 @@ def draw_preview(
     category_hint = " | ".join([f"{idx + 1}:{name}" for idx, name in enumerate(categories)])
     cv2.putText(
         frame,
-        f"Frame: {frame_idx} | Category: {current_category}",
+        f"Category: {current_category}",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -278,6 +304,17 @@ def draw_preview(
         2,
         cv2.LINE_AA,
     )
+    counts_hint = " | ".join([f"{name}:{category_counts.get(name,0)}" for name in categories])
+    cv2.putText(
+        frame,
+        f"Counts: {counts_hint}",
+        (10, 170),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (200, 200, 200),
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def main() -> None:
@@ -319,11 +356,12 @@ def main() -> None:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    frame_index = -1
+    loop_counter = -1
     saved_frames = 0
     saved_boxes = 0
     black_frame_streak = 0
     image_counter = read_image_counter(output_dir)
+    category_counts = read_category_counts(output_dir, categories)
 
     with annotation_path.open("a", newline="", encoding="utf-8") as csv_handle:
         writer = csv.writer(csv_handle)
@@ -334,8 +372,8 @@ def main() -> None:
                 if not ok:
                     break
 
-                frame_index += 1
-                if frame_index % args.frame_step != 0:
+                loop_counter += 1
+                if loop_counter % args.frame_step != 0:
                     continue
 
                 if not args.no_mirror:
@@ -363,15 +401,15 @@ def main() -> None:
                     boxes=boxes,
                     current_category=categories[current_category_index],
                     categories=categories,
-                    frame_idx=frame_index,
                     saved_frames=saved_frames,
                     saved_boxes=saved_boxes,
+                    category_counts=category_counts,
                 )
                 if black_frame_streak >= 5:
                     cv2.putText(
                         preview,
                         "Webcam appears black. Try --camera-index 1 or close other camera apps.",
-                        (10, 170),
+                        (10, 198),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,
                         (0, 120, 255),
@@ -397,7 +435,7 @@ def main() -> None:
 
                 if key == ord("s"):
                     if not boxes:
-                        print(f"Skipped save for frame {frame_index}: no hands detected.")
+                        print("Skipped save: no hands detected.")
                         continue
 
                     image_name = f"image{image_counter}.jpg"
@@ -407,12 +445,13 @@ def main() -> None:
                     selected_category = categories[current_category_index]
                     relative_image_path = image_path.relative_to(output_dir)
                     # Write CSV rows (legacy) and YOLOv8 .txt labels per image
+                    timestamp_ms = int(time.time() * 1000)
                     for box in boxes:
                         writer.writerow(
                             [
                                 str(relative_image_path).replace("\\", "/"),
-                                frame_index,
-                                frame_index,
+                                image_counter,
+                                timestamp_ms,
                                 selected_category,
                                 box["hand_index"],
                                 box["handedness"],
@@ -436,12 +475,16 @@ def main() -> None:
                         img_height=frame.shape[0],
                     )
 
+                    # increment counters and persist
+                    category_counts[selected_category] = category_counts.get(selected_category, 0) + 1
+                    write_category_counts(output_dir, category_counts)
+
                     image_counter += 1
                     write_image_counter(output_dir, image_counter)
                     saved_frames += 1
                     print(
-                        f"Saved frame {frame_index} with category '{selected_category}' "
-                        f"and {len(boxes)} hand box(es). Image: {image_path}"
+                        f"Saved {image_name} with category '{selected_category}' "
+                        f"and {len(boxes)} hand box(es)."
                     )
 
     cap.release()

@@ -1,0 +1,17 @@
+# Generated datasets
+hand_bbox_dataset/
+yolo_dataset_final/
+dataset/
+
+# Virtual environment
+67_Detector/
+
+# Python cache and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
